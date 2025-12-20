@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import re, math
+import re
 from telegram import InputMediaVideo
 import telethon
 import django
@@ -13,23 +13,22 @@ import os
 from district import get_district_by_coords, get_coords_by_address
 from make_info import process_text_with_gpt_price, process_text_with_gpt_sq, process_text_with_gpt_adress, \
     process_text_with_gpt_rooms
-from meters import get_coordinates, find_nearest_metro
+from meters import find_nearest_metro
 from proccess import process_text_with_gpt2, process_text_with_gpt3, process_text_with_gpt
-
+from typing import Any
 # Загружаем переменные окружения
 load_dotenv()
 # Настроить Django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 django.setup()
 
-from main.models import  DEVMESSAGE, DEVINFO, DEVSubscription  # Используем новую модель
+from main.models import  DEVMESSAGE, DEVINFO, DEVSubscription
 
 # Настройка логгера
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 processed_group_ids = set()      # (chat_id, grouped_id)
 processed_message_ids = set()
-
 
 bot2 = Bot(token=os.getenv("DEV_BOT_TOKEN_SUB"))
 # Конфигурация
@@ -44,9 +43,71 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID_DEV")
 YANDEX_GPT_API_KEY = os.getenv("YANDEX_GPT_API_KEY")
 DOWNLOAD_FOLDER = "downloads/"
 
+
 # Инициализация клиента Telethon
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH, system_version='1.2.3-zxc-custom',
                         device_model='aboba-linux-custom', app_version='1.0.1')
+
+def _norm_text(s: Any) -> str:
+    """Безопасно приводит значение к строке, убирает пробелы и NBSP."""
+    if s is None:
+        return ""
+    return str(s).strip().replace("\u00A0", " ")
+
+def _first_token(s: str) -> str:
+    """Берём первый «словесный» токен (буквы), игнорируя пунктуацию в начале."""
+    s = s.lstrip(" \t\n\r-—.,;:!?'\"()[]{}")
+    # собираем до первого пробела/пунктуации
+    token = []
+    for ch in s:
+        if ch.isalpha():
+            token.append(ch.lower())
+        else:
+            break
+    return "".join(token)
+
+_YES_TOKENS = {"да", "yes", "true", "y", "ok", "ага", "угу"}
+_NO_TOKENS  = {"нет", "no", "false", "n", "неа"}
+
+def coerce_to_bool(value: Any, default: bool | None = None) -> bool | None:
+    """
+    Пытается интерпретировать value как булево.
+    Возвращает True/False или default (по умолчанию None), если не распознано.
+
+    Примеры:
+      coerce_to_bool(" да ")        -> True
+      coerce_to_bool("Yes!")        -> True
+      coerce_to_bool(" false ")     -> False
+      coerce_to_bool(None)          -> None
+      coerce_to_bool("ok")          -> True
+      coerce_to_bool("не знаю")     -> None
+      coerce_to_bool(1)             -> True
+      coerce_to_bool(0)             -> False
+    """
+    # числовые быстрые пути
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+
+    text = _norm_text(value)
+    if not text:
+        return default
+
+    tok = _first_token(text)
+
+    if tok in _YES_TOKENS:
+        return True
+    if tok in _NO_TOKENS:
+        return False
+
+    # дополнительные формы типа "true/false" на английском могут прийти как целое слово
+    low = text.lower()
+    if low in {"true", "false"}:
+        return low == "true"
+
+    return default
 
 async def get_username_by_id(user_id):
     try:
@@ -242,91 +303,158 @@ async def check_subscriptions_and_notify(info_instance, contacts):
     logger.info(f"✅ Рассылка завершена: совпадений {len(matched_users)}")
 
 
-def escape_markdown(text: str) -> str:
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-def safe_parse_number(value):
+_NUM_RE = re.compile(r'^([+\-]?\d+(?:\.\d+)?)')
+
+def safe_parse_number(value: Any) -> float | None:
     """
-    Преобразует что угодно ('60 000', '60 000', '34,6', 35, None) → float | None.
-    Поддерживает обычные и узкие неразрывные пробелы.
+    Парсит число из строки/числа:
+    - понимает ведущий знак +/-
+    - пробелы и NBSP игнорируются
+    - запятая -> точка
+    - поддерживает «длинное» минус-символ U+2212
     """
     if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-
     s = str(value).strip()
 
-    # Нормализуем разделители
-    NBSP = '\u00A0'
-    NNBSP = '\u202F'
-    s = s.replace(NBSP, ' ').replace(NNBSP, ' ')
-    s = s.replace(',', '.')  # десятичная запятая → точка
+    # нормализуем пробелы/запятые/минусы
+    s = s.replace('\u00A0', ' ')   # NBSP -> space
+    s = s.replace('−', '-')        # U+2212 -> обычный дефис
+    s = s.replace(',', '.')        # , -> .
+    s = s.replace(' ', '')         # убираем все пробелы (разделители тысяч)
 
-    # Оставляем только цифры и одну точку
-    cleaned = []
-    dot_seen = False
-    for ch in s:
-        if ch.isdigit():
-            cleaned.append(ch)
-        elif ch == '.' and not dot_seen:
-            cleaned.append(ch)
-            dot_seen = True
-        # прочее отбрасываем (валюта, текст)
-
-    s2 = ''.join(cleaned)
-    if not s2:
+    m = _NUM_RE.match(s)
+    if not m:
         return None
     try:
-        return float(s2)
-    except Exception:
+        return float(m.group(1))
+    except ValueError:
         return None
 
 
-async def send_notification(user_id: int, ad_data: dict, message, contacts):
-    """
-    Отправка уведомления пользователю с поддержкой URL изображений (python-telegram-bot).
-    """
+async def new_message_handler(event):
+    bot = Bot(token=BOT_TOKEN)
+    logger.info(f"Новое сообщение из канала: {event.chat.username or event.chat.title}")
+
+    if not event.message:
+        return
+
+    msg = event.message
+
+    # --- защита от повторной обработки ---
+    key_msg = (msg.chat_id, msg.id)
+    if key_msg in processed_message_ids:
+        return
+    processed_message_ids.add(key_msg)
+
+    if getattr(msg, "grouped_id", None):
+        key_album = (msg.chat_id, msg.grouped_id)
+        if key_album in processed_group_ids:
+            return
+        processed_group_ids.add(key_album)
+
+    # -------- извлечение данных --------
+    text = await extract_text_from_event(event)
+    media_items = await download_media(event.message)
+    contacts = await process_contacts(text)
+
+    # нормализация tg://user?id=
+    if contacts and contacts.startswith("tg://user?id="):
+        user_id = contacts.split("=", 1)[1] if "=" in contacts else None
+        if not user_id:
+            return
+        fixed = await get_username_by_id(user_id)
+        if not fixed:
+            return
+        contacts = fixed
+
+    # -------- GPT --------
+    help_text = await asyncio.to_thread(process_text_with_gpt3, text)
+    new_text = await asyncio.to_thread(process_text_with_gpt, text)
+
+    # -------- нормализация текста --------
+    new_text = new_text.replace("*", "\n\n")
+    lines = [line.strip() for line in new_text.split("\n") if line.strip()]
+    new_text = "\n\n".join(lines)
+
+    # -------- фильтрация --------
+    if not is_yes(help_text):
+        return
+
+    if new_text.lower() in ("нет", "нет."):
+        return
+
+    # -------- адрес --------
+    address = await asyncio.to_thread(process_text_with_gpt_adress, new_text)
+
+    # удалить адрес от GPT
+    new_text = remove_address_block(new_text)
+
+    # вставить адрес красиво и синим
+    new_text = insert_address_after_area(new_text, address)
+
+    # -------- контакты --------
+    if contacts:
+        new_text += f"\n\nКонтакты: {contacts}"
+
+    # -------- цитата --------
+    new_text += (
+        "\n\n— <i>Настройте фильтры в "
+        "<a href='https://t.me/arendatoriy_find_bot'>боте</a> "
+        "и получайте только подходящие варианты</i>"
+    )
+
+    # -------- сохраняем --------
+    message = await sync_to_async(DEVMESSAGE.objects.create)(
+        text=text,
+        images=[item["path"] for item in media_items] if media_items else None,
+        new_text=new_text,
+    )
+
+    # -------- INFO --------
+    coords = get_coords_by_address(address)
+
+    def parse_flat_area(value):
+        if not value:
+            return None
+        m = re.search(r"(\d+(?:\.\d+)?)", str(value).replace(",", "."))
+        return int(round(float(m.group(1)))) if m else None
+
+    flat_area = parse_flat_area(
+        await asyncio.to_thread(process_text_with_gpt_sq, new_text)
+    )
+
+    info = await sync_to_async(DEVINFO.objects.create)(
+        message=message,
+        price=await asyncio.to_thread(process_text_with_gpt_price, new_text),
+        count_meters_flat=flat_area,
+        count_meters_metro=find_nearest_metro(*coords) if coords else None,
+        location=get_district_by_coords(*coords) if coords else None,
+        adress=address,
+        rooms=await asyncio.to_thread(process_text_with_gpt_rooms, new_text),
+    )
+
+    # -------- подписка --------
+    asyncio.create_task(check_subscriptions_and_notify(info, contacts))
+
+    # -------- канал --------
     try:
-        # Базовый текст из БД (уже отформатирован в new_message_handler)
-        safe_text = message.new_text or ""
-
-        # Добавим контакты и цитату, если ещё не добавлены здесь
-        # (на всякий случай делаем это и в уведомлениях — вдруг текст в БД был без них)
-        safe_text = build_post_text(safe_text, contacts, add_quote=True)
-
-        media_paths = ad_data.get('images') or []
-        media_group = []
-
-        for idx, media_path in enumerate(media_paths[:10]):
-            caption = safe_text if idx == 0 else None
-
-            if str(media_path).startswith("http"):
-                media_group.append(InputMediaPhoto(media=media_path, caption=caption, parse_mode="HTML"))
-            elif os.path.exists(media_path):
-                media_group.append(InputMediaPhoto(media=open(media_path, "rb"), caption=caption, parse_mode="HTML"))
-
-        await asyncio.sleep(5)
-
-        if media_group:
-            if len(media_group) == 1:
-                # одиночное фото
-                await bot2.send_photo(chat_id=user_id, photo=media_group[0].media, caption=safe_text, parse_mode="HTML")
-            else:
-                # альбом — parse_mode задан внутри каждого InputMediaPhoto
-                await bot2.send_media_group(chat_id=user_id, media=media_group)
+        if media_items:
+            await send_media_group(bot, TELEGRAM_CHANNEL_ID, new_text, media_items)
         else:
-            await bot2.send_message(chat_id=user_id, text=safe_text, parse_mode="HTML")
-
-        logger.info(f"[NOTIFY] Отправлено объявление пользователю {user_id}")
-
-    except RetryAfter as e:
-        logger.warning(f"[NOTIFY] Flood control, повтор через {e.timeout} сек.")
-        await asyncio.sleep(e.timeout)
-        await send_notification(user_id, ad_data, message, contacts)  # не забудь передать contacts
+            await bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                text=new_text,
+                parse_mode="HTML",
+            )
+        logger.info(f"[CHANNEL] Пост отправлен в {TELEGRAM_CHANNEL_ID}")
     except Exception as e:
-        logger.error(f"[NOTIFY] Ошибка при отправке уведомления пользователю {user_id}: {e}", exc_info=True)
+        logger.error(
+            f"[CHANNEL] Ошибка отправки в канал {TELEGRAM_CHANNEL_ID}: {e}",
+            exc_info=True,
+        )
+
 
 
 def is_ad_match_subscription(ad_data, subscription):
@@ -419,7 +547,55 @@ def is_ad_match_subscription(ad_data, subscription):
         return False
 
 
+async def send_notification(user_id, ad_data, message, contacts):
+    try:
+        # ❗ Готовый финальный текст из БД
+        safe_text = message.new_text or ""
 
+        media_paths = ad_data.get("images") or []
+        media_group = []
+
+        for idx, media_path in enumerate(media_paths[:10]):
+            caption = safe_text if idx == 0 else None
+
+            if isinstance(media_path, str) and media_path.startswith("http"):
+                media_group.append(
+                    InputMediaPhoto(
+                        media=media_path,
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                )
+            elif media_path and os.path.exists(media_path):
+                media_group.append(
+                    InputMediaPhoto(
+                        media=open(media_path, "rb"),
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                )
+
+        await asyncio.sleep(5)
+
+        if media_group:
+            if len(media_group) == 1:
+                await bot2.send_photo(
+                    chat_id=user_id,
+                    photo=media_group[0].media,
+                    caption=safe_text,
+                    parse_mode="HTML"
+                )
+            else:
+                await bot2.send_media_group(chat_id=user_id, media=media_group)
+        else:
+            await bot2.send_message(
+                chat_id=user_id,
+                text=safe_text,
+                parse_mode="HTML"
+            )
+
+    except Exception as e:
+        logger.error(f"[NOTIFY] Ошибка: {e}", exc_info=True)
 
 async def extract_text_from_event(event):
     """
@@ -442,124 +618,57 @@ async def extract_text_from_event(event):
                 return t
     return (msg.text or "").strip()
 
-# @client.on(events.NewMessage(chats=channel_entities))
-async def new_message_handler(event):
-    bot = Bot(token=BOT_TOKEN)
-    logger.info(f"Новое сообщение из канала: {event.chat.username or event.chat.title}")
+def insert_address_after_area(text: str, address: str) -> str:
+    """
+    Вставляет строку адреса В ОДНУ СТРОКУ:
+    📍 Адрес: <code>...</code>
+    строго после строки с площадью.
+    """
+    if not address:
+        return text
 
-    if event.message:
-        msg = event.message
+    lines = text.split("\n")
+    result = []
+    inserted = False
 
-        key_msg = (msg.chat_id, msg.id)
-        if key_msg in processed_message_ids:
-            logger.info('Skip: already processed this message id')
-            return
-        processed_message_ids.add(key_msg)
+    for line in lines:
+        result.append(line)
+        if not inserted and line.strip().startswith("👞 Площадь"):
+            result.append(f"📍 Адрес: <code>{address}</code>")
+            inserted = True
 
-        if getattr(msg, "grouped_id", None):
-            key_album = (msg.chat_id, msg.grouped_id)
-            if key_album in processed_group_ids:
-                logger.info('Skip: album already processed')
-                return
-            processed_group_ids.add(key_album)
-        text = await extract_text_from_event(event)
-        media_items = await download_media(event.message)
-        contacts = await process_contacts(text)
-        if contacts and contacts.startswith("tg://user?id="):
-            try:
-                user_id = contacts.split("=", 1)[1]
-            except Exception:
-                user_id = None
+    if not inserted:
+        result.append(f"📍 Адрес: <code>{address}</code>")
 
-            if user_id:
-                fixed = await get_username_by_id(user_id)
-                if fixed:
-                    contacts = fixed  # заменяем на читабельный @username/ссылку
-                else:
-                    logger.info("Пропуск: контакт tg://… не удалось преобразовать повторно.")
-                    return  # не отправляем это уведомление/пост
-            else:
-                logger.info("Пропуск: некорректный формат tg://user?id=…")
-                return
-        help_text = await asyncio.to_thread(process_text_with_gpt3, text)
-        new_text = await asyncio.to_thread(process_text_with_gpt, text)
-        new_text = new_text.replace("*", "\n\n")
-        lines = [line.strip() for line in new_text.split("\n") if line.strip()]
-        new_text = "\n\n".join(lines)
-        # БЫЛО: строгая проверка на "да"/"ответ: да"
-        if not _is_yes(help_text):
-            new_text = 'нет'
-        if _is_no(contacts):
-            new_text = 'нет'
-        print(new_text)
-
-        # Сохраняем сообщение в базу данных
-        message = await sync_to_async(DEVMESSAGE.objects.create)(
-            text=text,
-            images=[item['path'] for item in media_items] if media_items else None,
-            new_text=new_text
-        )
-
-        if not (new_text.lower() in ['нет', 'нет.']):
-            if not (new_text.lower() in ['нет', 'нет.']):
-                new_text += "\n\nКонтакты: " + contacts
-
-                # 📌 Добавляем цитату в конце
-                new_text += (
-                    "\n\n— <i>Настройте фильтры в "
-                    "<a href='https://t.me/arendatoriy_find_bot'>боте</a> "
-                    "и получайте только подходящие варианты</i>"
-                )
-            address = process_text_with_gpt_adress(new_text)
-            coords = get_coords_by_address(address)
-
-            def parse_flat_area(value):
-                if value is None:
-                    return None
-                s = str(value).replace(',', '.')
-                m = re.search(r'(\d+(?:\.\d+)?)', s)
-                if not m:
-                    return None
-                area = float(m.group(1))
-                # Принцип округления зафиксируйте один раз:
-                return int(round(area))  # или math.floor/math.ceil по вашему регламенту
-
-            flat_area = parse_flat_area(process_text_with_gpt_sq(new_text))
-
-            info = await sync_to_async(DEVINFO.objects.create)(
-                message=message,
-                price=process_text_with_gpt_price(new_text),
-                count_meters_flat=flat_area,
-                count_meters_metro=find_nearest_metro(*coords),
-                location=get_district_by_coords(*coords),
-                adress=address,
-                rooms=process_text_with_gpt_rooms(new_text)
-            )
-
-            # Уведомляем подписчиков
-            asyncio.create_task(check_subscriptions_and_notify(info, contacts))
-
-        # Отправляем результат в Telegram-канал
-        if new_text.lower() not in ['нет', 'нет.']:
-            try:
-                if media_items:
-                    await send_media_group(bot, TELEGRAM_CHANNEL_ID, new_text, media_items)
-                else:
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHANNEL_ID,
-                        text=new_text,
-                        parse_mode="HTML"
-                    )
-                logger.info(f"[CHANNEL] Пост отправлен в {TELEGRAM_CHANNEL_ID}")
-            except Exception as e:
-                logger.error(f"[CHANNEL] Ошибка отправки в канал {TELEGRAM_CHANNEL_ID}: {e}", exc_info=True)
+    return "\n".join(result).strip()
 
 
-def _is_yes(s: str | None) -> bool:
-    return bool(s) and re.match(r'^(да|yes|y|true)\b', s.strip(), flags=re.I)
 
-def _is_no(s: str | None) -> bool:
-    return bool(s) and re.match(r'^(нет|no|n|false)\b', s.strip(), flags=re.I)
+
+
+def remove_address_block(text: str) -> str:
+    """
+    Удаляет строки вида:
+    📍 Адрес: ...
+    Адрес: ...
+    """
+    lines = []
+    for line in text.split("\n"):
+        if re.match(r"\s*(📍\s*)?адрес\s*:", line, flags=re.I):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+
+def is_yes(value: Any) -> bool:
+    """Жёсткая проверка на согласие. Нераспознанное -> False."""
+    return coerce_to_bool(value, default=False) is True
+
+
+def is_no(value: Any) -> bool:
+    """Жёсткая проверка на отрицание. Нераспознанное -> False."""
+    return coerce_to_bool(value, default=False) is False and coerce_to_bool(value, default=None) is False
 
 
 

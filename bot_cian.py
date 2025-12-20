@@ -1,23 +1,21 @@
 import asyncio
-import shutil
-
+import os
+from dev_bot import remove_address_block, insert_address_after_area
 import aiohttp
+import logging
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import Command
 from dotenv import load_dotenv
-import os
-import re
-import time
-import logging
-
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from telegram import InputMediaPhoto
+from telegram.error import RetryAfter
 from asgiref.sync import sync_to_async
 import django
-
+from aiogram.types import InputMediaPhoto
+import time
+import undetected_chromedriver as uc
+from aiogram.types import InputMediaPhoto
+from aiogram.exceptions import TelegramRetryAfter
 from dev_bot import process_text_with_gpt2
 from district import get_coords_by_address, get_district_by_coords
 from make_info import process_text_with_gpt_adress, process_text_with_gpt_price, process_text_with_gpt_sq, \
@@ -30,6 +28,9 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 django.setup()
 
 # Импортируем модель MESSAGE
+
+# Загружаем переменные окружения
+
 from main.models import MESSAGE, INFO, Subscription
 
 # Загружаем переменные окружения
@@ -78,6 +79,12 @@ async def send_images_with_text(bot, chat_id, text, images):
         await bot.send_media_group(chat_id=chat_id, media=media_group)
 
 
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
 def escape_html(text: str) -> str:
     if text is None:
         return ""
@@ -101,132 +108,102 @@ def escape_md_v2(text):
     return "".join(f"\\{char}" if char in special_chars else char for char in text)
 
 
-def _which_browser_bin() -> str | None:
-    # 1) ищем по PATH
-    for name in ("google-chrome", "chromium", "chromium-browser"):
-        p = shutil.which(name)
-        if p:
-            return p
-    # 2) типовые пути
-    for p in ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
-        if os.path.exists(p):
-            return p
-    return None
+import os
+import re
+import time
+import logging
 
-def _create_uc_driver(version_main: int, headless: bool | None = None):
-    in_docker = os.path.exists("/.dockerenv") or os.getenv("IN_DOCKER") == "1"
-    if headless is None:
-        headless = True if in_docker else False
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
+def _create_uc_driver(headless: bool = False):
     options = uc.ChromeOptions()
+
     if headless:
         options.add_argument("--headless=new")
+
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
 
-    chrome_bin = _which_browser_bin()
-    if not chrome_bin:
-        logging.error("Браузер не найден. Установите chromium или google-chrome в контейнер.")
-        return None
+    # 🔑 ВАЖНО: реальный user-data-dir
+    profile_dir = os.path.join(os.getcwd(), "chrome_profile")
+    options.add_argument(f"--user-data-dir={profile_dir}")
 
-    logging.warning(f"=== UC START: version_main={version_main}, headless={headless}, bin={chrome_bin} ===")
+    logging.warning("=== UC START with user profile ===")
 
     driver = uc.Chrome(
         options=options,
-        version_main=version_main,          # можно убрать — uc сам подберёт; но так предсказуемей
-        use_subprocess=True,
-        browser_executable_path=chrome_bin, # ключевой момент: без ENV, по найденному пути
+        use_subprocess=True
     )
     driver.set_page_load_timeout(60)
     return driver
 
-def fetch_page_data(url: str):
+
+
+
+async def fetch_page_data(url: str):
     """
-    Загружает страницу объявления и возвращает (page_text, image_urls).
-    - Берём version_main из ENV (по умолчанию 141, т.к. сервер уже на 141).
-    - Одна повторная попытка, если драйвер подсказал другую мажорную версию.
-    - В контейнере принудительно headless + безопасные флаги.
+    Async Playwright версия для CIAN.
+    БЕЗ networkidle — CIAN его не даёт.
     """
+    from playwright.async_api import async_playwright
+    import asyncio
+    import os
+    import logging
+
+    profile_dir = os.path.join(os.getcwd(), "pw_profile")
+
     try:
-        version_main = int(os.getenv("UC_VERSION_MAIN", "141"))
-    except ValueError:
-        version_main = 141
+        async with async_playwright() as p:
+            browser = await p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                headless=False,
+                viewport={"width": 1920, "height": 1080},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
 
-    driver = None
-    try:
-        try:
-            driver = _create_uc_driver(version_main=version_main)
-            if not driver:
-                return "", []  # браузер не найден → выходим корректно
-        except Exception as e1:
-            msg = str(e1)
-            m = re.search(r"only supports Chrome version\s+(\d+)", msg)
-            if m:
-                hinted = int(m.group(1))
-                logger.warning(f"Повторный запуск UC с подсказанной версией: {hinted}")
-                driver = _create_uc_driver(version_main=hinted)
-                if not driver:
-                    return "", []
-            else:
-                logger.error(f"Не удалось запустить драйвер: {msg}")
-                return "", []
+            page = await browser.new_page()
 
-        logger.info(f"Открываю страницу: {url}")
-        driver.get(url)
+            logging.info(f"Открываю страницу (Playwright async): {url}")
 
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            # ⬇️ ВАЖНО: domcontentloaded вместо networkidle
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # лёгкая прокрутка, чтобы догрузились изображения
-        for _ in range(3):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(0.8)
-
-        page_text = driver.find_element(By.TAG_NAME, "body").text or ""
-
-        # собираем до 12 валидных картинок
-        images = []
-        for img in driver.find_elements(By.TAG_NAME, "img"):
-            src = img.get_attribute("src")
-            if src and src.startswith(("http://", "https://")) and "data:image" not in src:
-                images.append(src)
-            if len(images) >= 12:
-                break
-
-        # фолбэк на мобильную версию, если совсем пусто
-        if not page_text.strip() and not images and "://www.cian.ru/" in url:
+            # ⬇️ ждём реальный DOM-элемент, а не "тишину сети"
             try:
-                m_url = url.replace("://www.cian.ru/", "://m.cian.ru/")
-                driver.get(m_url)
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-                for _ in range(2):
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(0.6)
-                page_text = driver.find_element(By.TAG_NAME, "body").text or ""
-                images = []
-                for img in driver.find_elements(By.TAG_NAME, "img"):
-                    src = img.get_attribute("src")
-                    if src and src.startswith(("http://", "https://")) and "data:image" not in src:
-                        images.append(src)
-                    if len(images) >= 12:
-                        break
-            except Exception as e_mb:
-                logger.warning(f"Мобильная версия не помогла: {e_mb}")
+                await page.wait_for_selector("body", timeout=15000)
+            except:
+                pass
 
-        return page_text.strip(), images
+            # небольшая пауза, чтобы догрузился контент
+            await asyncio.sleep(3)
+
+            # текст страницы
+            page_text = await page.inner_text("body")
+
+            # картинки
+            images = []
+            img_elements = await page.query_selector_all("img")
+            for img in img_elements:
+                src = await img.get_attribute("src")
+                if src and src.startswith(("http://", "https://")):
+                    images.append(src)
+                if len(images) >= 12:
+                    break
+
+            await browser.close()
+            return page_text.strip(), images
 
     except Exception as e:
-        logger.error(f"Ошибка при загрузке страницы: {e}")
+        logging.error(f"Playwright ошибка: {e}", exc_info=True)
         return "", []
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+
 
 
 @sync_to_async
@@ -388,7 +365,7 @@ async def send_notification(user_id: int, ad_data: dict, message):
     quote = ("\n\n— <i>Настройте фильтры в "
              "<a href='https://t.me/arendatoriy_find_bot'>боте</a> "
              "и получайте только подходящие варианты</i>")
-    caption_html = escape_html(safe_text) + quote
+    caption_html = safe_text + quote
 
     media_paths = ad_data.get('images') or []
     usable = media_paths[2:10]  # пропускаем 2, максимум 8
@@ -436,7 +413,7 @@ async def send_to_channel(bot, channel_id: int, new_text: str, url: str, image_u
     """
     from aiogram.types import InputMediaPhoto
 
-    base = escape_html(new_text or "")
+    base = new_text or ""
     link = f"<a href='{escape_attr(url)}'>Контакты</a>"
     quote = ("\n\n— <i>Настройте фильтры в "
              "<a href='https://t.me/arendatoriy_find_bot'>боте</a> "
@@ -466,7 +443,7 @@ async def send_to_channel(bot, channel_id: int, new_text: str, url: str, image_u
 
 @dp.message()
 async def message_handler(message: Message):
-    # 1) Берём URL из сообщения и подтверждаем старт
+    # 1) Берём URL
     url = (message.text or "").strip()
     if not url:
         await message.answer("Пришлите ссылку на объявление CIAN.")
@@ -474,63 +451,78 @@ async def message_handler(message: Message):
 
     await message.answer("🔍 Обрабатываю страницу, подождите...")
 
-    # 2) Парсим страницу: сырой текст + src картинок (до 10)
-    text, images = fetch_page_data(url)
+    # 2) Парсим страницу
+    text, images = await fetch_page_data(url)
     if not text and not images:
-        await message.answer("⚠️ Не удалось найти данные на странице.")
+        await message.answer("⚠️ Не удалось получить данные со страницы.")
         return
 
-    # 3) (Опционально) «скачиваем» картинки — у тебя сохраняются URL
     image_urls = await download_images(images)
 
-    # 4) Готовим человекочитаемый текст объявления (без Markdown-звёздочек и мусора)
-    new_text = await asyncio.to_thread(process_text_with_gpt, text)  # CPU-bound → в поток
-    # убираем * и схлопываем пустые строки
-    new_text = new_text.replace("*", " ")
-    lines = [ln.strip() for ln in new_text.splitlines() if ln.strip()]
+    # 3) GPT → человекочитаемый текст
+    new_text = await asyncio.to_thread(process_text_with_gpt, text)
+
+    # --- НОРМАЛИЗАЦИЯ (как в dev_bot.py) ---
+    new_text = new_text.replace("*", "\n\n")
+    lines = [line.strip() for line in new_text.split("\n") if line.strip()]
     new_text = "\n\n".join(lines)
 
-    # 5) Сохраняем сообщение в БД (как и раньше — с добавлением "Контакты <url>")
+    # --- АДРЕС (ТОЧНО КАК В dev_bot.py) ---
+    address = await asyncio.to_thread(process_text_with_gpt_adress, new_text)
+
+    # 1️⃣ удаляем возможный адрес от GPT
+    new_text = remove_address_block(new_text)
+
+    # 2️⃣ вставляем адрес после строки с площадью
+    new_text = insert_address_after_area(new_text, address)
+
+    # 4) Сохраняем сообщение в БД (БЕЗ добавок "Контакты")
     mmessage = await sync_to_async(MESSAGE.objects.create)(
         text=text,
-        images=images if images else None,
-        new_text=new_text + f" Контакты {url}",
+        images=image_urls if image_urls else None,
+        new_text=new_text,
     )
 
-    # 6) Извлекаем структурку для DEVINFO и сохраняем
-    if new_text not in ("Нет", "Нет."):
-        address = process_text_with_gpt_adress(new_text)
+    # 5) INFO (для подписок)
+    if new_text.lower() not in ("нет", "нет."):
         coords = get_coords_by_address(address)
 
         def parse_flat_area(value):
-            """Преобразуем площадь к int, если пришла строка с 'м²' и пр."""
             try:
                 if isinstance(value, str):
                     digits = "".join(c for c in value if c.isdigit())
                     return int(digits) if digits else None
                 return int(value) if value is not None else None
-            except (ValueError, TypeError):
+            except Exception:
                 return None
 
-        flat_area = parse_flat_area(process_text_with_gpt_sq(new_text))
+        flat_area = parse_flat_area(
+            await asyncio.to_thread(process_text_with_gpt_sq, new_text)
+        )
 
         info = await sync_to_async(INFO.objects.create)(
             message=mmessage,
-            price=process_text_with_gpt_price(new_text),
+            price=await asyncio.to_thread(process_text_with_gpt_price, new_text),
             count_meters_flat=flat_area,
-            count_meters_metro=find_nearest_metro(*coords),
-            location=get_district_by_coords(*coords),
+            count_meters_metro=find_nearest_metro(*coords) if coords else None,
+            location=get_district_by_coords(*coords) if coords else None,
             adress=address,
-            rooms=process_text_with_gpt_rooms(new_text),
+            rooms=await asyncio.to_thread(process_text_with_gpt_rooms, new_text),
         )
-        # Асинхронно проверяем подписки и шлём уведомления
-        asyncio.create_task(check_subscriptions_and_notify(info))  # шлёт с HTML-цитатой и срезом 2:10
 
-    # 7) Публикуем в канал (функция уже делает HTML-цитату и берёт фото [2:10])
-    await send_to_channel(bot, TELEGRAM_CHANNEL_ID, new_text, url, image_urls)  # HTML+quote внутри функции. :contentReference[oaicite:2]{index=2}
+        asyncio.create_task(check_subscriptions_and_notify(info))
 
-    # 8) Ответ пользователю
-    await message.answer("✅ Данные сохранены и отправлены!")
+    # 6) Отправка в канал — текст уже ПРАВИЛЬНЫЙ
+    await send_to_channel(
+        bot,
+        TELEGRAM_CHANNEL_ID,
+        new_text,
+        url,
+        image_urls,
+    )
+
+    await message.answer("✅ Объявление сохранено и отправлено.")
+
 
 
 async def main():
