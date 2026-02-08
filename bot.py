@@ -10,6 +10,9 @@ from telethon import TelegramClient, events
 from dotenv import load_dotenv
 from asgiref.sync import sync_to_async
 import os
+
+from telethon.sessions import StringSession
+
 from district import get_district_by_coords, get_coords_by_address
 from make_info import process_text_with_gpt_price, process_text_with_gpt_sq, process_text_with_gpt_adress, \
     process_text_with_gpt_rooms
@@ -42,11 +45,10 @@ METRO_CLOSE_MAX_METERS = int(os.getenv("METRO_CLOSE_MAX_METERS", "1200"))
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 YANDEX_GPT_API_KEY = os.getenv("YANDEX_GPT_API_KEY")
 DOWNLOAD_FOLDER = "downloads/"
+SESSION_STRING = os.getenv("FUCK")
 
 
-
-# Инициализация клиента Telethon
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH, system_version='1.2.3-zxc-custom',
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, system_version='1.2.3-zxc-custom',
                         device_model='aboba-linux-custom', app_version='1.0.1')
 
 def _norm_text(s: Any) -> str:
