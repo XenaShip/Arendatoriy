@@ -677,7 +677,7 @@ def is_no(value: Any) -> bool:
 
 async def main():
     try:
-        await client.connect()
+        await client.start()
         if not await client.is_user_authorized():
             await client.send_code_request(PHONE_NUMBER)
             code = input('Введите код из Telegram: ')
